@@ -1,0 +1,19 @@
+# Build outputs
+build/
+build-*/
+out/
+*.o
+*.a
+*.elf
+*.oelf
+*.prx
+*.sprx
+*.self
+*.pkg
+*.gp4
+*.log
+# Local tools and test data
+tests/roms/
+docs-local/
+__pycache__/
+.claude/

@@ -1,0 +1,812 @@
+// Harissa64 - Nintendo 64 emulator for the PlayStation 4
+// Copyright (C) 2026 Mohamed Aymen
+// SPDX-License-Identifier: GPL-2.0-only
+// Harissa64 - HTTPS downloads from the console (see xb_net.h).
+// PS4: copied from the Xbox 360 front end (platform/xbox360/xb_net.cpp, v2 at
+// a82f344); the PS4 differences are under #if XB_PS4: sceNet sockets and
+// resolver instead of XNet/Winsock, the kernel's random numbers and clock.
+#include "xb_compat.h"
+#if XB_PS4
+#include <fcntl.h>
+#include <unistd.h>
+#include <orbis/libkernel.h>
+#include <orbis/Net.h>
+#include <orbis/Sysmodule.h>
+#else
+#include <xtl.h>
+#include <winsockx.h>
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "bearssl.h"
+#if XB_PS4
+#include "../../../core/common/h64_log.h"
+#include "../../../core/common/h64_version.h"
+#else
+#include "../../core/common/h64_log.h"
+#include "../../core/common/h64_version.h"
+#endif
+#include "xb_net.h"
+
+#if XB_PS4
+typedef int SOCKET;
+#define _strnicmp strncasecmp
+#define INVALID_SOCKET (-1)
+#define closesocket sceNetSocketClose
+static int WSAGetLastError(void) { return -1; }
+static LONG InterlockedCompareExchange(volatile LONG *p, LONG value, LONG expected)
+{
+    __atomic_compare_exchange_n(p, &expected, value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expected;
+}
+static void XeCryptRandom(u8 *pb, u32 cb)
+{
+    int fd = open("/dev/urandom", O_RDONLY);
+    u32 got = 0, i;
+    if (fd >= 0)
+    {
+        ssize_t n = read(fd, pb, cb);
+        if (n > 0) got = (u32)n;
+        close(fd);
+    }
+    for (i = got; i < cb; i++)
+    {
+        u64 t = sceKernelGetProcessTime() * 6364136223846793005ull + __builtin_ia32_rdtsc();
+        pb[i] = (u8)(t >> ((i & 7) * 8)) ^ (u8)(t >> 56);
+    }
+}
+struct Ps4SockaddrIn { u8 len, family; u16 port; u32 addr; u8 zero[8]; };
+#define PS4_SOL_SOCKET 0xFFFF
+#define PS4_SO_SNDTIMEO 0x1005
+#define PS4_SO_RCVTIMEO 0x1006
+#define PS4_SO_RCVBUF 0x1002
+static int s_netPool = -1;
+#else
+extern "C" VOID XeCryptRandom(PBYTE pb, DWORD cb);
+#endif
+
+#define SO_MARKINSECURE 0x5801
+#define NET_TIMEOUT_MS 10000
+#define NET_HEAD_MAX 16384
+#define NET_URL_MAX 4096
+#define NET_RCVBUF (1024 * 1024)
+
+static volatile LONG s_netState;
+static volatile LONG s_stackUp;
+
+#if XB_PS4
+static int wait_network(void) { return 1; }
+#else
+static int wait_network(void)
+{
+    XNADDR xna;
+    DWORD r = XNET_GET_XNADDR_PENDING;
+    int i;
+    for (i = 0; i < 150; i++)
+    {
+        if (!(XNetGetEthernetLinkStatus() & XNET_ETHERNET_LINK_ACTIVE)) { Sleep(100); continue; }
+        r = XNetGetTitleXnAddr(&xna);
+        if (r != XNET_GET_XNADDR_PENDING) break;
+        Sleep(100);
+    }
+    return r != XNET_GET_XNADDR_PENDING && r != XNET_GET_XNADDR_NONE;
+}
+#endif
+
+static int s_testOff;
+void NetTestOff(int mode) { s_testOff = mode; }
+int NetTestMode(void) { return s_testOff; }
+
+int NetStart(int retry)
+{
+    if (s_testOff == 1) return 0;
+    for (;;)
+    {
+        LONG st = InterlockedCompareExchange(&s_netState, 1, 0);
+        if (st == 0) break;
+        if (st == 1) { Sleep(50); continue; }
+        if (st == 3 && retry && InterlockedCompareExchange(&s_netState, 1, 3) == 3) break;
+        return st == 2;
+    }
+    if (!s_stackUp)
+    {
+#if XB_PS4
+        int rcMod = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET), rcInit = sceNetInit();
+        s_netPool = sceNetPoolCreate("harissa64", 64 * 1024, 0);
+        H64_INFO("[net] PS4 network: module %#x, init %#x, pool %#x", rcMod, rcInit, s_netPool);
+        if (s_netPool < 0)
+        {
+#else
+        XNetStartupParams xnsp;
+        WSADATA wsa;
+        memset(&xnsp, 0, sizeof(xnsp));
+        xnsp.cfgSizeOfStruct = sizeof(xnsp);
+        xnsp.cfgFlags = XNET_STARTUP_BYPASS_SECURITY;
+        if (XNetStartup(&xnsp) != 0 || WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        {
+#endif
+            H64_INFO("[net] no network stack");
+            InterlockedExchange(&s_netState, 3);
+            return 0;
+        }
+        InterlockedExchange(&s_stackUp, 1);
+    }
+    if (!wait_network())
+    {
+        H64_INFO("[net] no network");
+        InterlockedExchange(&s_netState, 3);
+        return 0;
+    }
+    InterlockedExchange(&s_netState, 2);
+    return 1;
+}
+
+struct NoAnchor
+{
+    const br_x509_class *vtable;
+    const br_x509_class **inner;
+};
+
+static void na_start_chain(const br_x509_class **ctx, const char *name)
+{
+    const br_x509_class **in = ((NoAnchor *)ctx)->inner;
+    (*in)->start_chain(in, name);
+}
+static void na_start_cert(const br_x509_class **ctx, uint32_t length)
+{
+    const br_x509_class **in = ((NoAnchor *)ctx)->inner;
+    (*in)->start_cert(in, length);
+}
+static void na_append(const br_x509_class **ctx, const unsigned char *buf, size_t len)
+{
+    const br_x509_class **in = ((NoAnchor *)ctx)->inner;
+    (*in)->append(in, buf, len);
+}
+static void na_end_cert(const br_x509_class **ctx)
+{
+    const br_x509_class **in = ((NoAnchor *)ctx)->inner;
+    (*in)->end_cert(in);
+}
+static unsigned na_end_chain(const br_x509_class **ctx)
+{
+    const br_x509_class **in = ((NoAnchor *)ctx)->inner;
+    unsigned r = (*in)->end_chain(in);
+    return r == BR_ERR_X509_NOT_TRUSTED ? 0 : r;
+}
+static const br_x509_pkey *na_get_pkey(const br_x509_class *const *ctx, unsigned *usages)
+{
+    const br_x509_class **in = ((NoAnchor *)ctx)->inner;
+    return (*in)->get_pkey(in, usages);
+}
+static const br_x509_class s_noAnchorVtable = {
+    sizeof(NoAnchor), na_start_chain, na_start_cert, na_append, na_end_cert, na_end_chain, na_get_pkey
+};
+
+struct NetIo
+{
+    SOCKET s;
+    u64 recvTicks;
+};
+static u64 qpc(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (u64)t.QuadPart;
+}
+static int sock_read(void *ctx, unsigned char *buf, size_t len)
+{
+    NetIo *io = (NetIo *)ctx;
+    u64 t0 = qpc();
+#if XB_PS4
+    int n = sceNetRecv(io->s, buf, len, 0);
+#else
+    int n = recv(io->s, (char *)buf, (int)len, 0);
+#endif
+    io->recvTicks += qpc() - t0;
+    return n > 0 ? n : -1;
+}
+static int sock_write(void *ctx, const unsigned char *buf, size_t len)
+{
+#if XB_PS4
+    int n = sceNetSend(((NetIo *)ctx)->s, buf, len, 0);
+#else
+    int n = send(((NetIo *)ctx)->s, (const char *)buf, (int)len, 0);
+#endif
+    return n > 0 ? n : -1;
+}
+
+static void ssl_time(uint32_t *days, uint32_t *secs)
+{
+    FILETIME ft;
+    ULARGE_INTEGER t;
+    unsigned long long unixSecs;
+    GetSystemTimeAsFileTime(&ft);
+    t.LowPart = ft.dwLowDateTime;
+    t.HighPart = ft.dwHighDateTime;
+    unixSecs = (t.QuadPart - 116444736000000000ULL) / 10000000ULL;
+#if XB_PS4
+    if (unixSecs < 1793491200ULL) unixSecs = 1793491200ULL;
+#endif
+    *days = (uint32_t)(unixSecs / 86400) + 719528;
+    *secs = (uint32_t)(unixSecs % 86400);
+}
+
+#if XB_PS4
+struct IN_ADDR { u32 s_addr; };
+static int resolve(const char *host, IN_ADDR *addr)
+{
+    OrbisNetInAddr a;
+    int rid = sceNetResolverCreate("harissa64", s_netPool, 0), rc;
+    if (rid < 0) { H64_INFO("[net] resolver: %#x", rid); return 0; }
+    a.s_addr = 0;
+    rc = sceNetResolverStartNtoa(rid, host, &a, NET_TIMEOUT_MS * 1000, 2, 0);
+    sceNetResolverDestroy(rid);
+    if (rc < 0) { H64_INFO("[net] name lookup of %s: %#x", host, rc); return 0; }
+    addr->s_addr = a.s_addr;
+    return 1;
+}
+#else
+static int resolve(const char *host, IN_ADDR *addr)
+{
+    XNDNS *dns = NULL;
+    WSAEVENT ev = WSACreateEvent();
+    int ok = 0;
+    if (ev == WSA_INVALID_EVENT) return 0;
+    if (XNetDnsLookup(host, ev, &dns) == 0 && dns)
+    {
+        WaitForSingleObject(ev, NET_TIMEOUT_MS);
+        if (dns->iStatus == 0 && dns->cina > 0) { *addr = dns->aina[0]; ok = 1; }
+        XNetDnsRelease(dns);
+    }
+    WSACloseEvent(ev);
+    return ok;
+}
+#endif
+
+struct NetTls
+{
+    br_ssl_client_context sc;
+    br_x509_minimal_context xc;
+    NoAnchor na;
+    br_sslio_context ioc;
+    unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
+};
+
+static const char *header(const char *head, const char *name, int *n)
+{
+    size_t k = strlen(name);
+    const char *p = head;
+    while ((p = strstr(p, "\r\n")) != NULL)
+    {
+        p += 2;
+        if (!_strnicmp(p, name, k) && p[k] == ':')
+        {
+            const char *v = p + k + 1, *e;
+            while (*v == ' ' || *v == '\t') v++;
+            for (e = v; *e && *e != '\r' && *e != '\n'; e++) ;
+            *n = (int)(e - v);
+            return v;
+        }
+    }
+    return NULL;
+}
+
+static int dechunk(u8 *buf, u32 len)
+{
+    u32 in = 0, out = 0;
+    for (;;)
+    {
+        u32 size = 0;
+        int digits = 0;
+        while (in < len)
+        {
+            u8 c = buf[in];
+            int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (v < 0) break;
+            if (size > 0x0FFFFFFF) return -1;
+            size = size * 16 + (u32)v;
+            digits++;
+            in++;
+        }
+        if (!digits) return -1;
+        while (in < len && buf[in] != '\n') in++;
+        if (in >= len) return -1;
+        in++;
+        if (!size) return (int)out;
+        if (size > len - in) return -1;
+        memmove(buf + out, buf + in, size);
+        out += size;
+        in += size;
+        if (in < len && buf[in] == '\r') in++;
+        if (in < len && buf[in] == '\n') in++;
+    }
+}
+
+struct NetSink
+{
+    FILE *f;
+    const char *path;
+    u32 from;
+    u32 expected;
+    u32 done;
+    int restarted;
+    int (*progress)(void *user, u32 done, u32 total);
+    void *user;
+    int stopped;
+};
+
+static FILE *open_sink(const char *path, const char *mode)
+{
+    FILE *f = fopen(path, mode);
+    if (f) setvbuf(f, NULL, _IOFBF, 1 << 20);
+    return f;
+}
+
+struct Dechunk
+{
+    int state;
+    u32 size;
+    int digits;
+};
+
+static int dechunk_feed(Dechunk *d, const u8 *p, u32 n, FILE *f)
+{
+    u32 i = 0;
+    int wrote = 0;
+    while (i < n && d->state != 4)
+    {
+        u8 c = p[i];
+        if (d->state == 0)
+        {
+            int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (v < 0)
+            {
+                if (!d->digits) return -1;
+                d->state = 1;
+                continue;
+            }
+            if (d->size > 0x07FFFFFF) return -1;
+            d->size = d->size * 16 + (u32)v;
+            d->digits++;
+            i++;
+        }
+        else if (d->state == 1 || d->state == 3)
+        {
+            i++;
+            if (c != '\n') continue;
+            if (d->state == 3) { d->state = 0; d->size = 0; d->digits = 0; }
+            else d->state = d->size ? 2 : 4;
+        }
+        else
+        {
+            u32 k = n - i < d->size ? n - i : d->size;
+            if (fwrite(p + i, 1, k, f) != k) return -1;
+            wrote += (int)k;
+            i += k;
+            d->size -= k;
+            if (!d->size) d->state = 3;
+        }
+    }
+    return wrote;
+}
+
+struct NetPostData { const char *data, *type, *agent; };
+
+static int request(const char *host, const char *path, u8 **body, u32 *bodyLen, u32 maxLen, char *location, int locSize,
+                   NetSink *sink, const NetPostData *post = NULL)
+{
+    NetTls *t;
+    IN_ADDR ip;
+#if XB_PS4
+    Ps4SockaddrIn sa;
+    int timeout = NET_TIMEOUT_MS * 1000;
+#else
+    SOCKADDR_IN sa;
+    BOOL one = TRUE;
+    DWORD timeout = NET_TIMEOUT_MS;
+#endif
+    SOCKET s;
+    NetIo io;
+    unsigned char seed[32];
+    uint32_t days, secs;
+    char *req = NULL, *head = NULL;
+    int n = 0, r, status = 0, hlen = 0, ok = 0;
+    u8 *buf = NULL;
+    u32 cap = 0, got = 0;
+
+    if (location && locSize) location[0] = 0;
+    if (strlen(path) + strlen(host) > NET_URL_MAX) return 0;
+    if (!resolve(host, &ip)) { H64_INFO("[net] cannot resolve %s", host); return 0; }
+#if XB_PS4
+    s = sceNetSocket("harissa64", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
+    if (s < 0) { H64_INFO("[net] socket: %#x", s); return 0; }
+    sceNetSetsockopt(s, PS4_SOL_SOCKET, PS4_SO_RCVTIMEO, &timeout, sizeof(timeout));
+    sceNetSetsockopt(s, PS4_SOL_SOCKET, PS4_SO_SNDTIMEO, &timeout, sizeof(timeout));
+    if (sink)
+    {
+        int rb = NET_RCVBUF;
+        sceNetSetsockopt(s, PS4_SOL_SOCKET, PS4_SO_RCVBUF, &rb, sizeof(rb));
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.len = sizeof(sa);
+    sa.family = ORBIS_NET_AF_INET;
+    sa.port = sceNetHtons(443);
+    sa.addr = ip.s_addr;
+    if ((r = sceNetConnect(s, (const OrbisNetSockaddr *)&sa, sizeof(sa))) < 0)
+    {
+        H64_INFO("[net] connect to %s: %#x", host, r);
+#else
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+    setsockopt(s, SOL_SOCKET, SO_MARKINSECURE, (const char *)&one, sizeof(one));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
+    if (sink)
+    {
+        int rb = NET_RCVBUF;
+        if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&rb, sizeof(rb)) != 0)
+            H64_INFO("[net] receive buffer of %d bytes refused (%d)", rb, WSAGetLastError());
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(443);
+    sa.sin_addr = ip;
+    if (connect(s, (const sockaddr *)&sa, sizeof(sa)) != 0)
+    {
+#endif
+        H64_INFO("[net] cannot connect to %s (%d)", host, WSAGetLastError());
+        closesocket(s);
+        return 0;
+    }
+    t = (NetTls *)malloc(sizeof(NetTls));
+    head = (char *)malloc(NET_HEAD_MAX + 1);
+    req = (char *)malloc(NET_URL_MAX + 512);
+    if (!t || !head || !req) { free(t); free(head); free(req); closesocket(s); return 0; }
+
+    br_ssl_client_init_full(&t->sc, &t->xc, NULL, 0);
+    ssl_time(&days, &secs);
+    br_x509_minimal_set_time(&t->xc, days, secs);
+    t->na.vtable = &s_noAnchorVtable;
+    t->na.inner = &t->xc.vtable;
+    br_ssl_engine_set_x509(&t->sc.eng, &t->na.vtable);
+    XeCryptRandom(seed, sizeof(seed));
+    br_ssl_engine_inject_entropy(&t->sc.eng, seed, sizeof(seed));
+    br_ssl_engine_set_buffer(&t->sc.eng, t->iobuf, sizeof(t->iobuf), 1);
+    br_ssl_client_reset(&t->sc, host, 0);
+    io.s = s;
+    io.recvTicks = 0;
+    br_sslio_init(&t->ioc, &t->sc.eng, sock_read, &io, sock_write, &io);
+
+    {
+        char range[48];
+        range[0] = 0;
+        if (sink && sink->from) _snprintf(range, sizeof(range) - 1, "Range: bytes=%u-\r\n", sink->from);
+        range[sizeof(range) - 1] = 0;
+        if (post)
+            _snprintf(req, NET_URL_MAX + 511,
+                      "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Harissa64/" H64_VERSION_STRING
+                      " (Xbox 360; https://github.com/kernel64/Harissa64)%s%s\r\nAccept: */*\r\nContent-Type: %s\r\n"
+                      "Content-Length: %u\r\nConnection: close\r\n\r\n",
+                      path, host, post->agent && post->agent[0] ? " " : "", post->agent ? post->agent : "",
+                      post->type ? post->type : "application/x-www-form-urlencoded", (unsigned)strlen(post->data));
+        else
+            _snprintf(req, NET_URL_MAX + 511,
+                      "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Harissa64/" H64_VERSION_STRING
+                      " (Xbox 360; https://github.com/kernel64/Harissa64)\r\nAccept: */*\r\n%sConnection: close\r\n\r\n",
+                      path, host, range);
+    }
+    req[NET_URL_MAX + 511] = 0;
+#if XB_PS4
+    if (br_sslio_write_all(&t->ioc, req, strlen(req)) != 0 ||
+        (post && post->data[0] && br_sslio_write_all(&t->ioc, post->data, strlen(post->data)) != 0) || br_sslio_flush(&t->ioc) != 0)
+    {
+        H64_INFO("[net] %s: TLS handshake or send failed, BearSSL error %d (62: certificate dates, 54-59: other certificate checks)", host,
+                 br_ssl_engine_last_error(&t->sc.eng));
+        goto done;
+    }
+#else
+    if (br_sslio_write_all(&t->ioc, req, strlen(req)) != 0) goto done;
+    if (post && post->data[0] && br_sslio_write_all(&t->ioc, post->data, strlen(post->data)) != 0) goto done;
+    if (br_sslio_flush(&t->ioc) != 0) goto done;
+#endif
+
+    while (n < NET_HEAD_MAX)
+    {
+        char *e;
+        r = br_sslio_read(&t->ioc, head + n, NET_HEAD_MAX - n);
+        if (r <= 0) break;
+        n += r;
+        head[n] = 0;
+        if ((e = strstr(head, "\r\n\r\n")) != NULL) { hlen = (int)(e - head) + 4; break; }
+    }
+    if (!hlen)
+    {
+        if (!n) H64_INFO("[net] %s: TLS error %d", host, br_ssl_engine_last_error(&t->sc.eng));
+        goto done;
+    }
+    head[hlen - 2] = 0;
+    if (strncmp(head, "HTTP/1.", 7) || strlen(head) < 12) goto done;
+    status = atoi(head + 9);
+    {
+        int vn;
+        const char *v = header(head, "location", &vn);
+        if (v && location && locSize > 0)
+        {
+            if (vn >= locSize) vn = locSize - 1;
+            memcpy(location, v, vn);
+            location[vn] = 0;
+        }
+    }
+    if (sink && status >= 200 && status < 300)
+    {
+        int vn;
+        const char *cl = header(head, "content-length", &vn), *te = header(head, "transfer-encoding", &vn);
+        u32 want = cl ? (u32)strtoul(cl, NULL, 10) : 0, got = 0;
+        int chunked = te && !_strnicmp(te, "chunked", 7);
+        Dechunk dc;
+        memset(&dc, 0, sizeof(dc));
+        if (chunked) want = 0;
+        if (status == 200 && sink->from)
+        {
+            fclose(sink->f);
+            sink->f = open_sink(sink->path, "wb");
+            if (!sink->f) goto done;
+            sink->from = 0;
+            sink->restarted = 1;
+        }
+        sink->done = sink->from;
+        if (want && sink->expected && sink->from + want != sink->expected)
+        {
+            H64_INFO("[net] %s: %u + %u bytes, %u expected", host, sink->from, want, sink->expected);
+            goto done;
+        }
+        if (n > hlen)
+        {
+            int w = chunked ? dechunk_feed(&dc, (const u8 *)head + hlen, (u32)(n - hlen), sink->f)
+                            : fwrite(head + hlen, 1, n - hlen, sink->f) == (size_t)(n - hlen) ? n - hlen : -1;
+            if (w < 0) { H64_INFO("[net] %s: bad chunked answer, or the file cannot be written", host); goto done; }
+            got = (u32)w;
+            sink->done += got;
+        }
+        buf = (u8 *)malloc(64 * 1024);
+        if (!buf) goto done;
+        {
+            LARGE_INTEGER fq;
+            u64 t0 = qpc(), diskTicks = 0, recv0 = io.recvTicks;
+            u32 logged = 0;
+            int rb = 0, rbl = sizeof(rb);
+            br_ssl_session_parameters sp;
+            QueryPerformanceFrequency(&fq);
+#if XB_PS4
+            (void)rbl;
+#else
+            getsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&rb, &rbl);
+#endif
+            br_ssl_engine_get_session_parameters(&t->sc.eng, &sp);
+            for (;;)
+            {
+                u64 tw;
+                if ((want && got >= want) || dc.state == 4) break;
+                if (sink->progress && sink->progress(sink->user, sink->done, sink->expected)) { sink->stopped = 1; break; }
+                r = br_sslio_read(&t->ioc, buf, 64 * 1024);
+                if (r <= 0) break;
+                tw = qpc();
+                if (chunked)
+                {
+                    r = dechunk_feed(&dc, buf, (u32)r, sink->f);
+                    if (r < 0) { r = -2; break; }
+                }
+                else if (fwrite(buf, 1, (size_t)r, sink->f) != (size_t)r) { r = -2; break; }
+                diskTicks += qpc() - tw;
+                got += (u32)r;
+                sink->done += (u32)r;
+                if (got - logged >= (32u << 20) || (want && got >= want))
+                {
+                    double all = (double)(qpc() - t0) / (double)fq.QuadPart;
+                    double net = (double)(io.recvTicks - recv0) / (double)fq.QuadPart;
+                    double disk = (double)diskTicks / (double)fq.QuadPart;
+                    logged = got;
+                    H64_INFO("[net] %u MB in %.1f s (%.2f MB/s): network %.1f s, disk %.1f s, decryption %.1f s; "
+                             "suite 0x%04X, receive buffer %d KB", got >> 20, all, all > 0 ? (double)got / 1048576.0 / all : 0.0,
+                             net, disk, all - net - disk, sp.cipher_suite, rb >> 10);
+                }
+            }
+            if (sink->stopped || r == -2) goto done;
+        }
+        fflush(sink->f);
+        if (want && got < want) { H64_INFO("[net] %s: cut at %u of %u bytes", host, got, want); goto done; }
+        if (chunked && dc.state != 4) { H64_INFO("[net] %s: chunked answer cut at %u bytes", host, got); goto done; }
+        ok = 1;
+        goto done;
+    }
+    if (!body || status < 200 || status >= 300) { ok = 1; goto done; }
+
+    {
+        int vn, chunked = 0;
+        const char *te = header(head, "transfer-encoding", &vn), *cl = header(head, "content-length", &vn);
+        u32 want = 0;
+        if (te && !_strnicmp(te, "chunked", 7)) chunked = 1;
+        if (cl && !chunked) want = (u32)strtoul(cl, NULL, 10);
+        if (want > maxLen) { H64_INFO("[net] %s%s: %u bytes, more than %u", host, path, want, maxLen); goto done; }
+        cap = want ? want : 64 * 1024;
+        buf = (u8 *)malloc(cap + 1);
+        if (!buf) goto done;
+        got = (u32)(n - hlen);
+        if (got > cap) got = cap;
+        memcpy(buf, head + hlen, got);
+        for (;;)
+        {
+            if (want && got >= want) break;
+            if (got == cap)
+            {
+                u8 *nb;
+                if (cap >= maxLen + (chunked ? maxLen / 16 + 4096 : 0)) { H64_INFO("[net] %s%s: more than %u bytes", host, path, maxLen); goto done; }
+                cap *= 2;
+                nb = (u8 *)realloc(buf, cap + 1);
+                if (!nb) goto done;
+                buf = nb;
+            }
+            r = br_sslio_read(&t->ioc, buf + got, cap - got);
+            if (r <= 0) break;
+            got += (u32)r;
+        }
+        if (want && got < want) { H64_INFO("[net] %s%s: cut at %u of %u bytes", host, path, got, want); goto done; }
+        if (chunked)
+        {
+            int d = dechunk(buf, got);
+            if (d < 0) { H64_INFO("[net] %s%s: bad chunked answer", host, path); goto done; }
+            got = (u32)d;
+        }
+        if (got > maxLen) goto done;
+        buf[got] = 0;
+        *body = buf;
+        *bodyLen = got;
+        buf = NULL;
+        ok = 1;
+    }
+
+done:
+    closesocket(s);
+    free(buf);
+    free(head);
+    free(req);
+    free(t);
+    return ok ? status : 0;
+}
+
+static int fetch(const char *host, const char *path, int follow, u8 **body, u32 *len, u32 maxLen, char *location, int locSize,
+                 NetSink *sink)
+{
+    char curHost[128], *curPath = (char *)malloc(NET_URL_MAX + 1), *loc = (char *)malloc(NET_URL_MAX + 1);
+    int hop, status = 0, done = 0;
+    if (body) *body = NULL;
+    if (len) *len = 0;
+    if (!curPath || !loc) { free(curPath); free(loc); return 0; }
+    strncpy(curHost, host, sizeof(curHost) - 1);
+    curHost[sizeof(curHost) - 1] = 0;
+    strncpy(curPath, path, NET_URL_MAX);
+    curPath[NET_URL_MAX] = 0;
+    for (hop = 0; hop < 5 && !done; hop++)
+    {
+        status = request(curHost, curPath, body, len, maxLen, loc, NET_URL_MAX + 1, sink);
+        if (location && locSize > 0)
+        {
+            strncpy(location, loc, locSize - 1);
+            location[locSize - 1] = 0;
+        }
+        if (!follow || status < 300 || status >= 400 || !loc[0]) { done = 1; break; }
+        if (!strncmp(loc, "https://", 8))
+        {
+            const char *h = loc + 8, *slash = strchr(h, '/');
+            size_t hl = slash ? (size_t)(slash - h) : strlen(h);
+            if (hl >= sizeof(curHost)) { status = 0; break; }
+            memcpy(curHost, h, hl);
+            curHost[hl] = 0;
+            strncpy(curPath, slash ? slash : "/", NET_URL_MAX);
+        }
+        else if (loc[0] == '/')
+            strncpy(curPath, loc, NET_URL_MAX);
+        else
+        {
+            status = 0;
+            break;
+        }
+        curPath[NET_URL_MAX] = 0;
+    }
+    if (!done) status = 0;
+    free(curPath);
+    free(loc);
+    return status;
+}
+
+int NetGet(const char *host, const char *path, int follow, u8 **body, u32 *len, u32 maxLen, char *location, int locSize)
+{
+    return fetch(host, path, follow, body, len, maxLen, location, locSize, NULL);
+}
+
+int NetPost(const char *host, const char *path, const char *data, const char *type, const char *agent, u8 **body, u32 *len, u32 maxLen)
+{
+    NetPostData post;
+    post.data = data ? data : "";
+    post.type = type;
+    post.agent = agent;
+    if (body) *body = NULL;
+    if (len) *len = 0;
+    return request(host, path, body, len, maxLen, NULL, 0, NULL, &post);
+}
+
+int NetDownload(const char *url, const char *file, u32 expected, int (*progress)(void *user, u32 done, u32 total), void *user)
+{
+    NetSink sink;
+    char host[128];
+    const char *h, *slash;
+    size_t hl;
+    int status, tries;
+    if (strncmp(url, "https://", 8)) return 0;
+    h = url + 8;
+    slash = strchr(h, '/');
+    hl = slash ? (size_t)(slash - h) : strlen(h);
+    if (!slash || hl >= sizeof(host)) return 0;
+    memcpy(host, h, hl);
+    host[hl] = 0;
+    memset(&sink, 0, sizeof(sink));
+    sink.expected = expected;
+    sink.path = file;
+    sink.progress = progress;
+    sink.user = user;
+    for (tries = 0; tries < 6; tries++)
+    {
+        long have;
+        sink.f = open_sink(file, "ab");
+        if (!sink.f) return 0;
+        fseek(sink.f, 0, SEEK_END);
+        have = ftell(sink.f);
+        sink.from = have > 0 ? (u32)have : 0;
+        if (expected && sink.from > expected)
+        {
+            fclose(sink.f);
+            sink.f = open_sink(file, "wb");
+            if (!sink.f) return 0;
+            sink.from = 0;
+        }
+        if (expected && sink.from == expected) { fclose(sink.f); return 1; }
+        status = fetch(host, slash, 1, NULL, NULL, 0, NULL, 0, &sink);
+        if (sink.f) fclose(sink.f);
+        if (sink.stopped) return -1;
+        if (status >= 200 && status < 300 && (!expected || sink.done == expected)) return 1;
+        if (status >= 400) { H64_INFO("[net] %s: HTTP %d", url, status); return 0; }
+        H64_INFO("[net] download interrupted at %u bytes, trying again", sink.done);
+        Sleep(2000);
+    }
+    return 0;
+}
+
+int NetSha256File(const char *file, char hex[65], int (*progress)(void *user, u32 done, u32 total), void *user)
+{
+    br_sha256_context c;
+    unsigned char out[32];
+    u8 *buf = (u8 *)malloc(1 << 20);
+    FILE *f = fopen(file, "rb");
+    u32 done = 0, total;
+    size_t n;
+    int i;
+    if (!buf || !f) { free(buf); if (f) fclose(f); return 0; }
+    fseek(f, 0, SEEK_END);
+    total = (u32)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    br_sha256_init(&c);
+    while ((n = fread(buf, 1, 1 << 20, f)) > 0)
+    {
+        br_sha256_update(&c, buf, n);
+        done += (u32)n;
+        if (progress && progress(user, done, total)) { fclose(f); free(buf); return -1; }
+    }
+    fclose(f);
+    free(buf);
+    br_sha256_out(&c, out);
+    for (i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", out[i]);
+    hex[64] = 0;
+    return 1;
+}

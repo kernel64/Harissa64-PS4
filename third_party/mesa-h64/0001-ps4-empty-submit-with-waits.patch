@@ -1,0 +1,33 @@
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+index 03c1209..4e6ae2a 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+@@ -1289,7 +1289,28 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
+    if (!queue_syncobj)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
++#ifdef __PS4__
++   /* Harissa64: the PS4 winsys has no sync files (one in-order queue), so an empty submission
++    * that waits (Granite ends a frame with one after a texture upload: the wait semaphore it
++    * left on its compute queue) failed below and lost the device. Wait for the points on the
++    * CPU instead; the signals then take the queue's last fence as usual. */
++   for (unsigned i = 0; i < sem_info->wait.syncobj_count; ++i) {
++      ret = ac_drm_cs_syncobj_wait(ctx->ws->dev, &sem_info->wait.syncobj[i], 1, INT64_MAX,
++                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
++      if (ret < 0)
++         return VK_ERROR_DEVICE_LOST;
++   }
++   for (unsigned i = 0; i < sem_info->wait.timeline_syncobj_count; ++i) {
++      ret = ac_drm_cs_syncobj_timeline_wait(
++         ctx->ws->dev, &sem_info->wait.syncobj[i + sem_info->wait.syncobj_count], &sem_info->wait.points[i], 1,
++         INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
++      if (ret < 0)
++         return VK_ERROR_DEVICE_LOST;
++   }
++   if (0) {
++#else
+    if (sem_info->wait.syncobj_count || sem_info->wait.timeline_syncobj_count) {
++#endif
+       int fd;
+       ret = ac_drm_cs_syncobj_export_sync_file(ctx->ws->dev, queue_syncobj, &fd);
+       if (ret < 0)

@@ -1,0 +1,360 @@
+// Harissa64 - Nintendo 64 emulator for the PlayStation 4
+// Copyright (C) 2026 Mohamed Aymen
+// SPDX-License-Identifier: GPL-2.0-only
+// Harissa64 V2 - front-end configuration (see xb_config.h).
+// PS4: copied from the Xbox 360 front end (platform/xbox360/xb_config.cpp, v2 at ac20c3d).
+#include "xb_config.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "xb_compat.h"
+#include "../ps4_audio.h"
+#define XB_AUDIO_DEFAULT_MS PS4_AUDIO_DEFAULT_MS
+
+static void trim(char *s)
+{
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = 0;
+}
+
+void ConfigDefaults(Config *c)
+{
+    strcpy(c->mode, "play");
+    strcpy(c->cpu, "dynarec");
+    c->rom[0] = 0;
+    c->lastRom[0] = 0;
+    strcpy(c->romDir, XB_GAME_DIR "/roms/");
+    c->showFps = 0;
+    c->hdTextures = 0;
+    c->hdBudget = 96;
+    c->hdCatalog[0] = 0;
+    c->hdPack[0] = 0;
+    c->cheats[0] = 0;
+    c->updateCheck = 1;
+    c->artDownload = 1;
+    c->browserDemo = 0;
+    c->browserSel[0] = 0;
+    c->filesOpen = 0;
+    c->artAll = 0;
+    c->gameFlags = -1;
+    c->logCpu = 5;
+    c->menuAt = 0;
+    c->aboutAt = 0;
+    c->cheatsAt = 0;
+    c->cheatOn = -1;
+    c->achievements = 0;
+    c->achAt = 0;
+    c->raTest = 0;
+    c->noNet = 0;
+    c->raToast = 0;
+    c->hdPage = 0;
+    c->controlsTest = -1;
+    c->autoStart = 0;
+    c->autoIndex = 0;
+    c->browserAt = 0;
+    c->hle = 1;
+    c->shotCount = 0;
+    c->softRenderer = 0;
+    c->xenosDebug = 0;
+    c->pauseAt = 0;
+    memset(&c->input, 0, sizeof(c->input));
+    c->trace = c->traceStep = 0;
+    c->xenia = 0;
+    c->lang[0] = 0;
+    c->uiLang[0] = 0;
+    c->langPick = 0;
+    c->rumble = 1;
+    c->langAuto = 0;
+    c->fpuFlags = 1;
+    c->jitFpu = 1;
+    c->regCache = 1;
+    c->fpCache = 1;
+    c->fastFpu = 1;
+    c->fullExits = 0;
+    c->statusFast = 1;
+    c->strict = 0;
+    c->superblocks = 1;
+    c->smooth = 1;
+    c->resScale = 3;
+    c->texFilter = 0;
+    c->sharpen = 1;
+    c->blur = 0;
+    c->screen = 0;
+    c->brightness = 0;
+    c->vsync = 0;
+#if XB_PS4
+    c->vsync = 1;
+    c->resScale = 1;
+#endif
+    c->deflicker = 0;
+#if XB_PS4
+    c->viAa = c->viScale = c->viDither = 1;
+    c->wide = 0;
+#endif
+    c->zoom = 100;
+    c->offsetX = c->offsetY = 0;
+    c->stretch = 0;
+    c->asyncGfx = 1;
+    c->parseWorker = 1;
+    c->asyncAudio = 1;
+    c->audioCycles = 100000;
+    c->gfxCycles = 400000;
+    c->gfxTiming = 0;
+    c->rdpSync = -1;
+    c->lateParse = -1;
+    c->cpiSet = 0;
+    c->cpi = 2;
+    c->exitAfter = 0;
+    c->stallMs = 100;
+    c->audioMs = XB_AUDIO_DEFAULT_MS;
+    c->wavDump = 0;
+    c->stateSlot = 1;
+    c->loadState = 0;
+    c->saveStateAt = 0;
+    {
+        int i;
+        for (i = 0; i < 4; i++) h64_padmap_default(&c->padMap[i]);
+    }
+}
+
+int ConfigParseFile(Config *c, const char *path)
+{
+    FILE *f = fopen(path, "r");
+    static char line[8192];
+    int menuFile = 0, settingsVer = 0, vsync = -1, resScale = -1;
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        char *eq = strchr(line, '=');
+        trim(line);
+        if (!strncmp(line, "# Written by the Harissa64 V2 menu", 34)) menuFile = 1;
+        if (line[0] == '#' || line[0] == ';' || !eq) continue;
+        *eq = 0;
+        if (!strcmp(line, "mode")) { strncpy(c->mode, eq + 1, sizeof(c->mode) - 1); c->mode[sizeof(c->mode) - 1] = 0; }
+        else if (!strcmp(line, "cpu")) { strncpy(c->cpu, eq + 1, sizeof(c->cpu) - 1); c->cpu[sizeof(c->cpu) - 1] = 0; }
+        else if (!strcmp(line, "rom")) { strncpy(c->rom, eq + 1, sizeof(c->rom) - 1); c->rom[sizeof(c->rom) - 1] = 0; }
+        else if (!strcmp(line, "lastrom")) { strncpy(c->lastRom, eq + 1, sizeof(c->lastRom) - 1); c->lastRom[sizeof(c->lastRom) - 1] = 0; }
+        else if (!strcmp(line, "romdir") && eq[1])
+        {
+            size_t n;
+            strncpy(c->romDir, eq + 1, sizeof(c->romDir) - 2);
+            c->romDir[sizeof(c->romDir) - 2] = 0;
+            n = strlen(c->romDir);
+            if (c->romDir[n - 1] != XB_SEP) { c->romDir[n] = XB_SEP; c->romDir[n + 1] = 0; }
+        }
+        else if (!strcmp(line, "showfps")) c->showFps = atoi(eq + 1);
+        else if (!strcmp(line, "hdtextures")) c->hdTextures = atoi(eq + 1);
+        else if (!strcmp(line, "hdbudget")) c->hdBudget = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "hdpack"))
+        {
+            strncpy(c->hdPack, eq + 1, sizeof(c->hdPack) - 1);
+            c->hdPack[sizeof(c->hdPack) - 1] = 0;
+        }
+        else if (!strcmp(line, "cheats"))
+        {
+            strncpy(c->cheats, eq + 1, sizeof(c->cheats) - 1);
+            c->cheats[sizeof(c->cheats) - 1] = 0;
+        }
+        else if (!strcmp(line, "hdcatalog"))
+        {
+            strncpy(c->hdCatalog, eq + 1, sizeof(c->hdCatalog) - 1);
+            c->hdCatalog[sizeof(c->hdCatalog) - 1] = 0;
+        }
+        else if (!strcmp(line, "updatecheck")) c->updateCheck = atoi(eq + 1);
+        else if (!strcmp(line, "artdownload")) c->artDownload = atoi(eq + 1);
+        else if (!strcmp(line, "browserdemo")) c->browserDemo = atoi(eq + 1);
+        else if (!strcmp(line, "filesopen")) c->filesOpen = atoi(eq + 1);
+        else if (!strcmp(line, "browsersel")) { strncpy(c->browserSel, eq + 1, sizeof(c->browserSel) - 1); c->browserSel[sizeof(c->browserSel) - 1] = 0; }
+        else if (!strcmp(line, "artall")) c->artAll = atoi(eq + 1);
+        else if (!strcmp(line, "gameflags")) c->gameFlags = (int)strtoul(eq + 1, NULL, 16);
+        else if (!strcmp(line, "logcpu")) c->logCpu = atoi(eq + 1);
+        else if (!strcmp(line, "menuat")) c->menuAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "aboutat")) c->aboutAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "cheatsat")) c->cheatsAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "cheaton")) c->cheatOn = atoi(eq + 1);
+        else if (!strcmp(line, "achievements")) c->achievements = atoi(eq + 1);
+        else if (!strcmp(line, "achat")) c->achAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "ratest")) c->raTest = atoi(eq + 1);
+        else if (!strcmp(line, "nettest")) c->netTest = atoi(eq + 1);
+        else if (!strcmp(line, "nonet")) c->noNet = atoi(eq + 1);
+        else if (!strcmp(line, "ratoast")) c->raToast = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "hdpage")) c->hdPage = atoi(eq + 1);
+        else if (!strcmp(line, "controlstest")) c->controlsTest = atoi(eq + 1);
+        else if (!strcmp(line, "autostart")) c->autoStart = atoi(eq + 1);
+        else if (!strcmp(line, "browserat")) c->browserAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "hle")) c->hle = atoi(eq + 1);
+        else if (!strcmp(line, "exitafter")) c->exitAfter = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "stallms")) c->stallMs = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "stateslot")) c->stateSlot = atoi(eq + 1);
+        else if (!strcmp(line, "audioms")) c->audioMs = atoi(eq + 1);
+        else if (!strcmp(line, "wavdump")) c->wavDump = atoi(eq + 1);
+        else if (!strcmp(line, "loadstate")) c->loadState = atoi(eq + 1);
+        else if (!strcmp(line, "savestateat")) c->saveStateAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "renderer")) c->softRenderer = !strcmp(eq + 1, "soft");
+        else if (!strcmp(line, "trace")) c->trace = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "xenia")) c->xenia = atoi(eq + 1);
+        else if (!strcmp(line, "lang")) { strncpy(c->lang, eq + 1, sizeof(c->lang) - 1); c->lang[sizeof(c->lang) - 1] = 0; }
+        else if (!strcmp(line, "uilang")) { strncpy(c->uiLang, eq + 1, sizeof(c->uiLang) - 1); c->uiLang[sizeof(c->uiLang) - 1] = 0; }
+        else if (!strcmp(line, "langpick")) c->langPick = atoi(eq + 1);
+        else if (!strcmp(line, "rumble")) c->rumble = atoi(eq + 1);
+        else if (!strcmp(line, "langauto")) c->langAuto = atoi(eq + 1);
+        else if (!strcmp(line, "fpuflags")) c->fpuFlags = atoi(eq + 1);
+        else if (!strcmp(line, "jitfpu")) c->jitFpu = atoi(eq + 1);
+        else if (!strcmp(line, "regcache")) c->regCache = atoi(eq + 1);
+        else if (!strcmp(line, "fpcache")) c->fpCache = atoi(eq + 1);
+        else if (!strcmp(line, "fastfpu")) c->fastFpu = atoi(eq + 1);
+        else if (!strcmp(line, "fullexits")) c->fullExits = atoi(eq + 1);
+        else if (!strcmp(line, "statusfast")) c->statusFast = atoi(eq + 1);
+        else if (!strcmp(line, "strict")) c->strict = atoi(eq + 1);
+        else if (!strcmp(line, "superblocks")) c->superblocks = atoi(eq + 1);
+        else if (!strcmp(line, "smooth")) c->smooth = atoi(eq + 1);
+        else if (!strcmp(line, "resolution")) resScale = atoi(eq + 1);
+        else if (!strcmp(line, "texfilter")) c->texFilter = atoi(eq + 1);
+        else if (!strcmp(line, "sharpen")) c->sharpen = atoi(eq + 1);
+        else if (!strcmp(line, "crt")) c->screen = atoi(eq + 1) ? 3 : 0;
+        else if (!strcmp(line, "screen")) c->screen = atoi(eq + 1);
+        else if (!strcmp(line, "brightness")) c->brightness = atoi(eq + 1);
+        else if (!strcmp(line, "vsync")) vsync = atoi(eq + 1);
+        else if (!strcmp(line, "settingsver")) settingsVer = atoi(eq + 1);
+        else if (!strcmp(line, "deflicker")) c->deflicker = atoi(eq + 1);
+#if XB_PS4
+        else if (!strcmp(line, "viaa")) c->viAa = atoi(eq + 1);
+        else if (!strcmp(line, "viscale")) c->viScale = atoi(eq + 1);
+        else if (!strcmp(line, "vidither")) c->viDither = atoi(eq + 1);
+        else if (!strcmp(line, "widescreen")) c->wide = atoi(eq + 1);
+        else if (!strcmp(line, "resforce")) c->resForce = atoi(eq + 1);
+        else if (!strcmp(line, "rescaleat")) c->rescaleAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "shotat")) c->shotAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "shotn")) c->shotN = (u32)atoi(eq + 1);
+#endif
+        else if (!strcmp(line, "zoom")) c->zoom = atoi(eq + 1);
+        else if (!strcmp(line, "posx")) c->offsetX = atoi(eq + 1);
+        else if (!strcmp(line, "posy")) c->offsetY = atoi(eq + 1);
+        else if (!strcmp(line, "stretch")) c->stretch = atoi(eq + 1);
+        else if (!strcmp(line, "blur")) c->blur = atoi(eq + 1);
+        else if (!strcmp(line, "asyncgfx")) c->asyncGfx = atoi(eq + 1);
+        else if (!strcmp(line, "parseworker")) c->parseWorker = atoi(eq + 1);
+        else if (!strcmp(line, "asyncaudio")) c->asyncAudio = atoi(eq + 1);
+        else if (!strcmp(line, "audiocycles")) c->audioCycles = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "gfxcycles")) c->gfxCycles = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "gfxtiming")) c->gfxTiming = atoi(eq + 1);
+        else if (!strcmp(line, "rdpsync")) c->rdpSync = atoi(eq + 1);
+        else if (!strcmp(line, "lateparse")) c->lateParse = atoi(eq + 1);
+        else if (!strcmp(line, "cpi")) { c->cpi = atoi(eq + 1); c->cpiSet = 1; }
+        else if (!strcmp(line, "xenosdebug")) c->xenosDebug = atoi(eq + 1);
+        else if (!strcmp(line, "pauseat")) c->pauseAt = (u32)atoi(eq + 1);
+        else if (!strcmp(line, "input")) h64_input_script_parse(&c->input, eq + 1);
+        else if (!strcmp(line, "tracestep")) c->traceStep = (u32)strtoul(eq + 1, NULL, 10);
+        else if (!strncmp(line, "map", 3)) h64_padmap_parse_key(&c->padMap[0], line, eq + 1);
+        else if (line[0] == 'p' && line[1] >= '2' && line[1] <= '4' && line[2] == '_' && !strncmp(line + 3, "map", 3))
+            h64_padmap_parse_key(&c->padMap[line[1] - '1'], line + 3, eq + 1);
+        else if (!strcmp(line, "shots"))
+        {
+            char *p = eq + 1;
+            while (*p && c->shotCount < 64)
+            {
+                c->shots[c->shotCount++] = (u32)strtoul(p, &p, 10);
+                while (*p == ',' || *p == ' ') p++;
+            }
+        }
+    }
+    fclose(f);
+#if XB_PS4
+    if (menuFile && settingsVer < 3) vsync = resScale = -1;
+#endif
+    if (resScale >= 0) c->resScale = resScale;
+    if (vsync >= 0 && !(menuFile && settingsVer < 2 && vsync == 1)) c->vsync = vsync;
+    return 1;
+}
+
+int ConfigWriteMenuKeys(const Config *c, const char *path, int withLastRom)
+{
+    FILE *f = fopen(path, "w");
+    int i;
+    if (!f) return 0;
+    fprintf(f, "# Written by the Harissa64 V2 menu\nsettingsver=%d\ncpu=%s\nhle=%d\naudioms=%d\nsmooth=%d\nshowfps=%d\n", XB_PS4 ? 3 : 2, c->cpu,
+            c->hle, c->audioMs, c->smooth, c->showFps);
+    fprintf(f, "resolution=%d\ntexfilter=%d\nsharpen=%d\nblur=%d\nscreen=%d\nbrightness=%d\nvsync=%d\nstretch=%d\ndeflicker=%d\n", c->resScale,
+            c->texFilter, c->sharpen, c->blur, c->screen, c->brightness, c->vsync, c->stretch, c->deflicker);
+    fprintf(f, "zoom=%d\nposx=%d\nposy=%d\nrumble=%d\nhdtextures=%d\n", c->zoom, c->offsetX, c->offsetY, c->rumble, c->hdTextures);
+#if XB_PS4
+    fprintf(f, "viaa=%d\nviscale=%d\nvidither=%d\nwidescreen=%d\n", c->viAa, c->viScale, c->viDither, c->wide);
+#endif
+    if (withLastRom) fprintf(f, "artdownload=%d\nachievements=%d\n", c->artDownload, c->achievements);
+#if XB_PS4
+    if (!withLastRom && c->resForce) fprintf(f, "resforce=1\n");
+#endif
+    if (!withLastRom && c->cheats[0]) fprintf(f, "cheats=%s\n", c->cheats);
+    if (!withLastRom && c->hdPack[0]) fprintf(f, "hdpack=%s\n", c->hdPack);
+    for (i = 0; i < 4; i++)
+    {
+        const H64PadMap *m = &c->padMap[i];
+        char pre[8];
+        int k;
+        pre[0] = 0;
+        if (i) sprintf(pre, "p%d_", i + 1);
+        fprintf(f, "%smap=default\n", pre);
+        if (h64_padmap_is_default(m)) continue;
+        for (k = 0; k < H64_N64_COUNT; k++)
+        {
+            char src[256];
+            h64_padmap_format_sources(m->src[k], src, sizeof(src));
+            fprintf(f, "%smap_%s=%s\n", pre, h64_padmap_n64_name(k), src);
+        }
+        fprintf(f, "%smap_stick=%s\n%smap_deadzone=%d\n%smap_range=%d\n", pre,
+                m->stick == H64_STICK_RIGHT ? "right" : m->stick == H64_STICK_DPAD ? "dpad" : m->stick == H64_STICK_NONE ? "none" : "left",
+                pre, m->deadzone, pre, m->range);
+        fprintf(f, "%smap_invert=%s\n", pre, m->invert == 3 ? "xy" : m->invert == 2 ? "y" : m->invert == 1 ? "x" : "none");
+    }
+    if (withLastRom && c->lastRom[0]) fprintf(f, "lastrom=%s\n", c->lastRom);
+    if (withLastRom && _stricmp(c->romDir, XB_GAME_DIR "/roms/")) fprintf(f, "romdir=%s\n", c->romDir);
+    if (withLastRom && c->lang[0]) fprintf(f, "lang=%s\n", c->lang);
+    fclose(f);
+    return 1;
+}
+
+int ConfigWriteLang(const char *path, const char *code)
+{
+    return ConfigWriteKey(path, "lang", code);
+}
+
+int ConfigWriteKey(const char *path, const char *key, const char *value)
+{
+    static char in[16384], out[16384 + 320];
+    size_t len = 0, used = 0, pos = 0, kl = strlen(key);
+    int found = 0;
+    if (kl > 32 || strlen(value) > 256) return 0;
+    FILE *f = fopen(path, "rb");
+    if (f)
+    {
+        len = fread(in, 1, sizeof(in), f);
+        fclose(f);
+        if (len == sizeof(in)) return 0;
+    }
+    while (pos < len)
+    {
+        size_t end = pos;
+        while (end < len && in[end] != '\n') end++;
+        if (end < len) end++;
+        if (end - pos >= kl + 1 && !memcmp(in + pos, key, kl) && in[pos + kl] == '=')
+        {
+            if (!found) used += sprintf(out + used, "%s=%s\n", key, value);
+            found = 1;
+        }
+        else
+        {
+            memcpy(out + used, in + pos, end - pos);
+            used += end - pos;
+            if (end == len && out[used - 1] != '\n') out[used++] = '\n';
+        }
+        pos = end;
+    }
+    if (!found) used += sprintf(out + used, "%s=%s\n", key, value);
+    f = fopen(path, "wb");
+    if (!f) return 0;
+    if (fwrite(out, 1, used, f) != used) { fclose(f); return 0; }
+    fclose(f);
+    return 1;
+}
