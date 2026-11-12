@@ -25,7 +25,7 @@
 #include "../../../core/pif/h64_padmap.h"
 
 #define XB_PS4 1
-#define XB_HAS_RES_AUTO 0
+#define XB_HAS_RES_AUTO 1
 #define XB_HAS_NET 1
 #define XB_HAS_HD 0
 #define XB_HAS_UPDATE 0

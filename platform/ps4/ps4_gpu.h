@@ -42,7 +42,7 @@ void ps4_gpu_picture_fx(const Vulkan::ImageView &view, const Vulkan::ImageView &
 void ps4_gpu_end_frame(void);
 void ps4_gpu_set_vsync(int on);
 double ps4_gpu_flip_wait_ms(void);
-#define PS4_BACKGROUND_PAUSE 0
+#define PS4_BACKGROUND_PAUSE 1
 void ps4_gpu_wait_foreground(void);
 void ps4_gpu_flip_stats(unsigned *oneRefresh, unsigned *longer);
 

@@ -9,7 +9,8 @@ Use it only with games you own. No ROMs are included, and none will be.
 ## What it does
 
 - Runs N64 games from `.z64`, `.v64`, `.n64` and `.zip` files, most of them at full speed on a base PS4.
-- Internal resolution: native, x2 or x4. It can be changed while a game runs.
+- Internal resolution: native, x2, x4, or Auto (starts high and steps down when the console cannot keep the game's speed). It can be changed while a game runs.
+- The game pauses while the app is in the background (PS button) and goes on when you come back.
 - 16:9 widescreen with a wider view (not stretched), or the 4:3 picture stretched, or plain 4:3.
 - The N64's own video filters (anti-aliasing, smoothing, dither filter) can each be turned off for a sharper picture; edge smoothing, sharpening, blur, scanlines and CRT effects on top.
 - Save states (9 slots per game), the games' own saves (EEPROM, SRAM, FlashRAM, Controller Pak), Rumble Pak.
@@ -52,7 +53,7 @@ The N64 buttons can be remapped per controller in Settings > Controls. The front
 
 - HD texture packs are not supported: the renderer (ParaLLEl-RDP) draws the N64's own textures.
 - A few games are recommended at x2 because they draw high-resolution pictures; choosing x4 for them asks first.
-- Heavy scenes of some games run under full speed at x4 on a base PS4: x2 is the answer for now.
+- Heavy scenes of some games run under full speed at x4 on a base PS4: Auto, or x2, is the answer for now.
 - With the low-level RSP (Settings > Advanced) widescreen is not available and most games are slower.
 - Homebrew cannot award PlayStation trophies.
 
